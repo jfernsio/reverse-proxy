@@ -24,37 +24,38 @@ var (
 		{URL: "http://localhost:9000", IsAlive: true},
 		{URL: "http://localhost:9001", IsAlive: true},
 	}
-	connectionsCount = 0
+	lcMu sync.Mutex
 )
 
-// health check for backends
 func healthCheck() {
+	client := &http.Client{Timeout: 5 * time.Second}
 	for {
 		for i := range backends {
-			resp, err := http.Get(backends[i].URL)
+			resp, err := client.Get(backends[i].URL + "/health")
+			alive := err == nil && resp != nil && resp.StatusCode == 200
+			if resp != nil {
+				resp.Body.Close()
+			}
 
-			if err != nil || resp.StatusCode != 200 {
-				backends[i].IsAlive = false
-				log.Println(backends[i].URL, "is DOWN!")
-			} else {
-				backends[i].IsAlive = true
+			if alive != backends[i].IsAlive {
+				backends[i].IsAlive = alive
+				if alive {
+					log.Printf("✅ %s is BACK online", backends[i].URL)
+				} else {
+					log.Printf("❌ %s is DOWN!", backends[i].URL)
+				}
 			}
 		}
-		time.Sleep(30 * time.Second)
+		time.Sleep(15 * time.Second)
 	}
 }
 
-// simple least connection load balcncer
-var lcMu sync.Mutex
-
 func getLeastConnBackend() *Backend {
-
 	lcMu.Lock()
 	defer lcMu.Unlock()
+
 	var chosen *Backend
 	for i := range backends {
-		//choose backend with least active connections, if tie, randomly choose one
-		//skip ded backends
 		if !backends[i].IsAlive {
 			continue
 		}
@@ -63,64 +64,63 @@ func getLeastConnBackend() *Backend {
 			chosen = &backends[i]
 		}
 	}
-	if len(backends) == 0 {
+	if chosen == nil {
 		return nil
 	}
-
 	chosen.ActiveCon++
 	return chosen
-
 }
 
 func main() {
 	go healthCheck()
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Extract IP without port
+		// Rate limiting (1 req/sec per IP)
 		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
-
 		now := time.Now()
-
-		//apply rate limitin for each IP to 1 req per sec
 		mu.Lock()
-		if t, ok := lastRequest[ip]; ok {
-			if now.Sub(t) < time.Second {
-				mu.Unlock()
-				http.Error(w, "Too many requests", http.StatusTooManyRequests)
-				return
-			}
+		if t, ok := lastRequest[ip]; ok && now.Sub(t) < time.Second {
+			mu.Unlock()
+			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+			return
 		}
 		lastRequest[ip] = now
 		mu.Unlock()
 
-		// Get backend per request
+		// Select backend
 		backend := getLeastConnBackend()
 		if backend == nil {
 			http.Error(w, "No backends available", http.StatusServiceUnavailable)
 			return
 		}
+
 		targetURL, err := url.Parse(backend.URL)
 		if err != nil {
-			http.Error(w, "Invalid backend URL", http.StatusBadRequest)
+			lcMu.Lock()
+			backend.ActiveCon--
+			lcMu.Unlock()
+			http.Error(w, "Invalid backend", http.StatusBadGateway)
 			return
 		}
 
+		log.Printf("→ %s %s %s → %s", ip, r.Method, r.URL.Path, backend.URL)
+
 		proxy := httputil.NewSingleHostReverseProxy(targetURL)
+		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Printf("Proxy error to %s: %v", backend.URL, err)
+		}
 
-		log.Printf("%s %s %s -> %s", ip, r.Method, r.URL.Path, targetURL)
-		//free up conn count after req is served
-
+		// Decrement connection count after request
 		defer func() {
 			lcMu.Lock()
 			backend.ActiveCon--
 			lcMu.Unlock()
-			log.Printf("Backend chosen: %s (Active: %d)", backend.URL, backend.ActiveCon)
+			log.Printf("← %s finished (Active: %d)", backend.URL, backend.ActiveCon)
 		}()
 
 		proxy.ServeHTTP(w, r)
-
 	})
 
-	log.Println("Starting reverse proxy server on :8080")
+	log.Println("🚀 GoBalancer started on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
