@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -20,11 +22,8 @@ type Backend struct {
 var (
 	lastRequest = make(map[string]time.Time)
 	mu          sync.Mutex
-	backends    = []Backend{
-		{URL: "http://localhost:9000", IsAlive: true},
-		{URL: "http://localhost:9001", IsAlive: true},
-	}
-	lcMu sync.Mutex
+	backends    []Backend
+	lcMu        sync.Mutex
 )
 
 func healthCheck() {
@@ -71,6 +70,28 @@ func getLeastConnBackend() *Backend {
 	return chosen
 }
 
+func init() {
+	backendStr := os.Getenv("BACKENDS")
+	if backendStr == "" {
+		backendStr = "http://backend:9000,http://backend:9001"
+		log.Println("Backend env not set using localhost as fallback")
+	} else {
+		log.Printf("Using backends from env: %s", backendStr)
+	}
+	backendUrls := strings.Split(backendStr, ",")
+	backends = make([]Backend, 0, len(backendUrls))
+
+	for _, b := range backendUrls {
+		b = strings.TrimSpace(b)
+		if b != "" {
+			backends = append(backends, Backend{URL: b, IsAlive: true})
+		}
+	}
+	if len(backends) == 0 {
+		log.Fatal("No valid backends provided!")
+	}
+	log.Printf("Configured backends:%d", len(backends))
+}
 func main() {
 	go healthCheck()
 
